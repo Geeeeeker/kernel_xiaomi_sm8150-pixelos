@@ -1,0 +1,490 @@
+name: 多系统版本，以此份为基础！boot需要修改为pe官方提供的img！编译内核 ( LXC/Docker + USB/IP + RTL8188EUS)
+
+on:
+  push:
+    branches:
+      - dev/*
+      - stable/*
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      android_version:
+        description: '分支'
+        required: true
+        default: 'fourteen'
+        type: choice
+        options:
+          - 'pie'
+          - 'ten'
+          - 'eleven'
+          - 'twelve'
+          - 'thirteen'
+          - 'fourteen'
+
+env:
+  DEVICE: raphael
+  DEFCONFIG: raphael_defconfig
+  MAGISK_CANARY_URL: https://github.com/topjohnwu/Magisk/releases/download/v30.7/Magisk-v30.7.apk
+  KERNELSU_VERSION: v0.9.5
+  APATCH_VERSION: 11142
+  APATCH_TAG: 11142_166daa0_on_HEAD-release-signed
+
+jobs:
+  build:
+    name: 编译内核 (raphael)
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+
+    steps:
+      # ========== 基础环境准备 ==========
+      - name: 安装依赖软件包
+        run: |
+          sudo apt update
+          sudo apt install -y \
+            ccache \
+            binutils-aarch64-linux-gnu \
+            binutils-arm-linux-gnueabi \
+            gcc-aarch64-linux-gnu \
+            gcc-arm-linux-gnueabi
+
+      # ========== 设定 Android 版本与工具链 ==========
+      - name: 设定 Android 版本及对应 Clang
+        id: setup-version
+        run: |
+          # 手动触发时使用输入值，否则默认 fourteen
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            ANDROID_VER="${{ github.event.inputs.android_version }}"
+          else
+            ANDROID_VER="fourteen"
+          fi
+          echo "ANDROID_VERSION=${ANDROID_VER}" >> $GITHUB_ENV
+
+          # 根据分支选择 Clang 工具链
+          case "${ANDROID_VER}" in
+            "pie")
+              CLANG_VER="r383902b"
+              ;;
+            "ten")
+              CLANG_VER="r383902b"
+              ;;
+            "eleven")
+              CLANG_VER="r383902b"
+              ;;
+            "twelve")
+              CLANG_VER="r416183b"
+              ;;
+            "thirteen")
+              CLANG_VER="r450784d"
+              ;;
+            "fourteen")
+              CLANG_VER="r487747c"
+              ;;
+            *)
+              echo "Unsupported branch: ${ANDROID_VER}"
+              exit 1
+              ;;
+          esac
+          CLANG_TARBALL="clang-${CLANG_VER}.tar.gz"
+          CLANG_URL="https://github.com/Geeeeeker/boot/releases/download/clang-prebuilts-20260319-031015/${CLANG_TARBALL}"
+          echo "CLANG_VERSION=${CLANG_VER}" >> $GITHUB_ENV
+          echo "CLANG_TARBALL_URL=${CLANG_URL}" >> $GITHUB_ENV
+
+      - name: 检出内核源码 (分支 ${{ env.ANDROID_VERSION }})
+        uses: actions/checkout@v4
+        with:
+          repository: Geeeeeker/kernel_xiaomi_sm8150-pixelos
+          ref: ${{ env.ANDROID_VERSION }}
+          path: kernel
+
+      # ========== 覆盖为统一 defconfig (来自 fourteen 分支) ==========
+      - name: 使用统一的 raphael_defconfig (基于 fourteen)
+        working-directory: kernel
+        run: |
+          curl -LSs https://raw.githubusercontent.com/Geeeeeker/kernel_xiaomi_raphael/refs/heads/fourteen/arch/arm64/configs/raphael_defconfig \
+            -o arch/arm64/configs/raphael_defconfig
+
+      # ========== 源码快速修复 ==========
+      - name: 修复 atomic_cond_read_relaxed 缺失 (旧内核适配)
+        working-directory: kernel
+        run: |
+          cat >> include/linux/atomic.h << 'ATOMIC_FIX_EOF'
+      
+          #ifndef smp_cond_load_relaxed
+          #define smp_cond_load_relaxed(ptr, cond_expr) ({             \
+              typeof(ptr) __PTR = (ptr);                              \
+              typeof(*ptr) VAL;                                       \
+              for (;;) {                                              \
+                  VAL = READ_ONCE(*__PTR);                            \
+                  if (cond_expr)                                      \
+                      break;                                          \
+                  cpu_relax();                                        \
+              }                                                       \
+              VAL;                                                    \
+          })
+          #endif
+      
+          #ifndef atomic_cond_read_relaxed
+          #define atomic_cond_read_relaxed(v, c)  smp_cond_load_relaxed(&(v)->counter, (c))
+          #endif
+
+          ATOMIC_FIX_EOF
+      - name: Fix usbip udev_context if present
+        run: |
+          files=$(find . -name "vhci_driver.c" -type f)
+          if [ -n "$files" ]; then
+            for f in $files; do
+              sed -i 's/^struct udev \*udev_context;/extern struct udev \*udev_context;/' "$f"
+              echo "Fixed $f"
+            done
+          else
+            echo "No vhci_driver.c found, skipping fix"
+          fi
+        working-directory: ${{ github.workspace }}
+      # ========== Clang 工具链缓存与下载 ==========
+      - name: 缓存 Clang 工具链
+        id: cache-clang
+        uses: actions/cache@v4
+        with:
+          path: clang
+          key: clang-${{ env.CLANG_VERSION }}
+
+      - name: 下载 Clang 工具链
+        if: steps.cache-clang.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p clang
+          curl -LSs "${{ env.CLANG_TARBALL_URL }}" | tar xz -C clang
+
+      - name: 缓存 ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: kernel-${{ env.DEVICE }}-${{ env.ANDROID_VERSION }}-${{ github.run_id }}
+          restore-keys: kernel-${{ env.DEVICE }}-${{ env.ANDROID_VERSION }}
+          max-size: 5G
+
+      # ========== 内核配置修改 (LXC/Docker / RTL8188EUS / 修复) ==========
+      - name: 配置 LXC 和 Docker 内核支持
+        working-directory: kernel
+        run: |
+          DEFCONFIG="arch/arm64/configs/${{ env.DEFCONFIG }}"
+
+          rm -rf utils
+          git clone https://github.com/tomxi1997/lxc-docker-support-for-android.git utils
+
+          if ! grep -q 'source "utils/Kconfig"' Kconfig; then
+            echo 'source "utils/Kconfig"' >> Kconfig
+          fi
+
+          echo "CONFIG_DOCKER=y" >> "${DEFCONFIG}"
+          sed -i '/CONFIG_ANDROID_PARANOID_NETWORK/d' "${DEFCONFIG}"
+          echo "# CONFIG_ANDROID_PARANOID_NETWORK is not set" >> "${DEFCONFIG}"
+
+          if [ -f kernel/cgroup/cgroup.c ]; then
+            sh utils/runcpatch.sh kernel/cgroup/cgroup.c
+          elif [ -f kernel/cgroup.c ]; then
+            sh utils/runcpatch.sh kernel/cgroup.c
+          else
+            echo "Warning: cgroup.c not found, skipping runcpatch.sh"
+          fi
+
+          if [ -f net/netfilter/xt_qtaguid.c ]; then
+            patch -p0 < utils/xt_qtaguid.patch
+          fi
+
+          sed -i '/CONFIG_LOCALVERSION/d' "${DEFCONFIG}"
+          echo 'CONFIG_LOCALVERSION="-LXC-KSU-Next"' >> "${DEFCONFIG}"
+
+      - name: 添加 rtl8188eus WiFi 驱动
+        working-directory: kernel
+        run: |
+          git clone --depth=1 --branch master https://github.com/Geeeeeker/android_kernel_xiaomi_sdm845.git rtl8188eus-repo
+          if [ -d "rtl8188eus-repo/drivers/rtl8188eus" ]; then
+            cp -r rtl8188eus-repo/drivers/rtl8188eus drivers/
+            echo 'obj-$(CONFIG_RTL8188EU) += rtl8188eus/' >> drivers/Makefile
+            echo 'source "drivers/rtl8188eus/Kconfig"' >> drivers/Kconfig
+          else
+            echo "Error: rtl8188eus directory not found"
+            exit 1
+          fi
+          rm -rf rtl8188eus-repo
+
+      # ========== rtl8188eus 兼容性修补 (仅 eleven 分支) ==========
+      - name: 修补 rtl8188eus 驱动 (eleven cfg80211_roamed API)
+        if: env.ANDROID_VERSION == 'eleven'
+        working-directory: kernel
+        run: |
+          cd drivers/rtl8188eus
+          if [ -f os_dep/linux/ioctl_cfg80211.c ]; then
+            sed -i '/^#else$/,/^#endif \/\*LINUX_VERSION_CODE >= KERNEL_VERSION(4, 12, 0)\*\// {
+              /cfg80211_roamed(padapter->pnetdev/ {
+                :a
+                N
+                /);/!ba
+                s/.*cfg80211_roamed.*\n.*\n.*\n.*\n.*\n.*\n.*\n.*);/\
+          \t\tstruct cfg80211_roam_info roam_info = {\
+          \t\t\t.bssid = cur_network->network.MacAddress,\
+          \t\t\t.req_ie = pmlmepriv->assoc_req + sizeof(struct rtw_ieee80211_hdr_3addr) + 2,\
+          \t\t\t.req_ie_len = pmlmepriv->assoc_req_len - sizeof(struct rtw_ieee80211_hdr_3addr) - 2,\
+          \t\t\t.resp_ie = pmlmepriv->assoc_rsp + sizeof(struct rtw_ieee80211_hdr_3addr) + 6,\
+          \t\t\t.resp_ie_len = pmlmepriv->assoc_rsp_len - sizeof(struct rtw_ieee80211_hdr_3addr) - 6,\
+          \t\t};\
+          \t\tcfg80211_roamed(padapter->pnetdev, \&roam_info, GFP_ATOMIC);/
+              }
+            }' os_dep/linux/ioctl_cfg80211.c
+          fi
+
+      - name: 禁用 PROCESS_RECLAIM (eleven 分支)
+        if: env.ANDROID_VERSION == 'eleven'
+        working-directory: kernel
+        run: |
+          DEFCONFIG="arch/arm64/configs/${{ env.DEFCONFIG }}"
+          sed -i 's/^CONFIG_PROCESS_RECLAIM=y/# CONFIG_PROCESS_RECLAIM is not set/' "${DEFCONFIG}"
+          echo "# CONFIG_PROCESS_RECLAIM is not set" >> "${DEFCONFIG}"
+      # ========== 编译主内核 ==========
+      - name: 编译内核
+        working-directory: kernel
+        run: |
+          export SHELL=/bin/bash
+          export PATH="$GITHUB_WORKSPACE/clang/bin:$PATH"
+          export KBUILD_BUILD_USER="${{ github.repository_owner }}"
+          export KBUILD_BUILD_HOST="github-runner"
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+          make -j$(nproc --all) \
+            SHELL=/bin/bash \
+            CC="ccache clang" \
+            LD=ld.lld \
+            ARCH=arm64 \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            O=out \
+            KCFLAGS="-Wno-unknown-warning-option -Wno-unused-but-set-variable" \
+            ${{ env.DEFCONFIG }} Image.gz-dtb
+
+      # ========== USB/IP 支持 ==========
+      - name: 设置 QEMU 用户态支持 (用于 arm64 容器)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-user-static binfmt-support
+          docker run --rm --privileged multiarch/qemu-user-static --reset -p yes
+
+      - name: 编译 USB/IP 内核模块（可选）
+        working-directory: kernel
+        run: |
+          export SHELL=/bin/bash
+          export PATH="$GITHUB_WORKSPACE/clang/bin:$PATH"
+          make -j$(nproc) \
+            SHELL=/bin/bash \
+            ARCH=arm64 \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            O=out \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            LD=ld.lld \
+            M=drivers/usb/usbip \
+            modules || echo "Warning: USB/IP modules build skipped or failed."
+
+          mkdir -p $GITHUB_WORKSPACE/usbip-out/modules
+          if ls out/drivers/usb/usbip/*.ko 1> /dev/null 2>&1; then
+              cp out/drivers/usb/usbip/*.ko $GITHUB_WORKSPACE/usbip-out/modules/
+          else
+              echo "No USB/IP kernel modules generated (probably built-in)."
+          fi
+
+      - name: 编译 USB/IP 用户态工具 (Docker arm64 容器)
+        run: |
+          mkdir -p usbip-out/{bin,libs}
+          docker run --rm --platform linux/arm64 \
+            --memory=4g \
+            -v ${{ github.workspace }}:/workspace \
+            -v ${{ github.workspace }}/usbip-out:/output \
+            -w /workspace/kernel \
+            arm64v8/ubuntu:22.04 \
+            bash -c "
+              set -e
+              export DEBIAN_FRONTEND=noninteractive
+              ulimit -s unlimited
+              apt update
+              apt install -y \
+                build-essential \
+                autoconf \
+                libtool \
+                pkg-config \
+                libudev-dev \
+                libssl-dev \
+                flex \
+                bison \
+                file \
+                patchelf
+              cd tools/usb/usbip
+              ./autogen.sh
+              ./configure CFLAGS=\"-Wno-error -Wno-error=stringop-truncation\" --with-tcp-wrappers=no
+              make -j1
+              cp src/.libs/usbip /output/bin/
+              cp src/.libs/usbipd /output/bin/
+              cp libsrc/.libs/libusbip.so.0* /output/libs/
+              cd /output
+              BINARIES=\"bin/usbip bin/usbipd libs/libusbip.so.0*\"
+              DEPS=\"\"
+              for file in \$BINARIES; do
+                if [ -f \"\$file\" ]; then
+                  needed=\$(readelf -d \"\$file\" | grep NEEDED | awk '{print \$5}' | tr -d '[]' || true)
+                  for lib in \$needed; do
+                    if [[ \"\$DEPS\" != *\"\$lib\"* ]]; then
+                      DEPS=\"\$DEPS \$lib\"
+                    fi
+                  done
+                fi
+              done
+              for lib in \$(echo \$DEPS | tr ' ' '\\n' | sort -u); do
+                libpath=\$(ldconfig -p | grep \"\$lib (\" | head -1 | awk '{print \$NF}' || true)
+                if [ -z \"\$libpath\" ]; then
+                  libpath=\$(find /lib /usr/lib -name \"\$lib\" -type f 2>/dev/null | head -1 || true)
+                fi
+                if [ -n \"\$libpath\" ]; then
+                  cp -P \"\$libpath\" libs/ 2>/dev/null || cp \"\$libpath\" libs/
+                  for reallib in \$(find \"\$(dirname \"\$libpath\")\" -name \"\${lib%.so*}*\" -type f 2>/dev/null); do
+                    cp -n \"\$reallib\" libs/ 2>/dev/null || true
+                  done
+                fi
+              done
+              ld_linux=\"/lib/ld-linux-aarch64.so.1\"
+              if [ -f \"\$ld_linux\" ]; then
+                cp -P \"\$ld_linux\" libs/
+              fi
+            "
+
+      - name: 打包 USB/IP 产物
+        run: |
+          cd usbip-out
+          tar czf ../usbip-arm64-bundle.tar.gz .
+          cd ..
+
+      - name: 上传 USB/IP 捆绑包 (Artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: usbip-arm64-bundle
+          path: usbip-arm64-bundle.tar.gz
+
+      # ========== 打包 AnyKernel3 ==========
+      - name: 打包 AnyKernel3 刷机包
+        run: |
+          git clone https://github.com/osm0sis/AnyKernel3 --depth=1 ak3
+          cp kernel/out/arch/arm64/boot/Image.gz-dtb ak3/
+          cp kernel/out/arch/arm64/boot/dtbo.img ak3/ || true
+
+          cd ak3
+          cat >anykernel.sh <<EOF
+          properties() { '
+          kernel.string=Kernel for ${{ env.DEVICE }} with KSU Next + SUSFS + LXC/Docker
+          device.name1=${{ env.DEVICE }}
+          do.devicecheck=1
+          '; }
+          ramdisk_compression=auto
+          patch_vbmeta_flag=auto
+          is_slot_device=auto
+          block=auto
+          . tools/ak3-core.sh
+          split_boot
+          flash_boot
+          EOF
+
+          DATE=$(date +%Y%m%d)
+          ZIP_NAME="anykernel3-${{ env.DEVICE }}-${{ env.ANDROID_VERSION }}-${DATE}.zip"
+          zip -qr9 "${ZIP_NAME}" * -x .git .github README.md *placeholder
+          mv "${ZIP_NAME}" ../
+          echo "AK3_ZIP_NAME=${ZIP_NAME}" >> $GITHUB_ENV
+
+      - name: 上传 AnyKernel3 安装包
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-${{ env.DEVICE }}-ak3
+          path: anykernel3-*.zip
+
+      # ========== 打包 boot.img (LineageOS) ==========
+      - name: 打包 boot.img
+        run: |
+          git clone --depth=1 https://android.googlesource.com/platform/system/tools/mkbootimg mkbootimg
+          cp kernel/out/arch/arm64/boot/Image.gz-dtb mkbootimg/
+
+          cd mkbootimg
+          BOOT_IMG_URL="https://github.com/Geeeeeker/boot/releases/download/extracted-roms-20260322-062443/LineageOS_boot.img"
+          curl -LSs "$BOOT_IMG_URL" -o boot.img
+
+          mkbootimg_args=$(./unpack_bootimg.py --out out --boot_img boot.img --format mkbootimg)
+          mv Image.gz-dtb out/kernel
+          eval "./mkbootimg.py $mkbootimg_args -o boot-lineage-${{ env.DEVICE }}.img"
+
+          echo "BOOT_IMG_NAME=boot-lineage-${{ env.DEVICE }}.img" >> $GITHUB_ENV
+
+      - name: 上传 boot 镜像
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-${{ env.DEVICE }}-boot
+          path: mkbootimg/boot-lineage-${{ env.DEVICE }}.img
+
+      # ========== 下载管理器 APK ==========
+      - name: 创建 APK 输出目录
+        run: mkdir -p apk-output
+
+      - name: 下载 KernelSU Manager APK
+        run: |
+          wget -O apk-output/KernelSU-Manager.apk \
+            https://github.com/tiann/KernelSU/releases/download/${{ env.KERNELSU_VERSION }}/KernelSU_${{ env.KERNELSU_VERSION }}_11872-release.apk
+
+      - name: 下载 APatch Manager APK
+        run: |
+          APATCH_URL="https://github.com/bmax121/APatch/releases/download/${{ env.APATCH_VERSION }}/APatch_${{ env.APATCH_TAG }}.apk"
+          wget -O apk-output/APatch-Manager.apk "$APATCH_URL"
+
+      - name: 下载 Magisk Canary APK
+        run: |
+          wget -O apk-output/Magisk-Canary.apk "${{ env.MAGISK_CANARY_URL }}"
+
+      - name: 上传 APK 工件
+        uses: actions/upload-artifact@v4
+        with:
+          name: Manager-APKs
+          path: apk-output/*.apk
+
+  release:
+    name: 发布
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - name: 下载所有构建产物
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: kernel-*
+          merge-multiple: true
+
+      - name: 获取 USB/IP 捆绑包
+        uses: actions/download-artifact@v4
+        with:
+          name: usbip-arm64-bundle
+          path: artifacts/usbip
+
+      - name: 获取 APK 合集
+        uses: actions/download-artifact@v4
+        with:
+          name: Manager-APKs
+          path: artifacts/manager
+
+      - name: 生成时间戳
+        id: time
+        run: |
+          echo "time=$(TZ='Asia/Shanghai' date -u +'%Y%m%d%H%M')" >> $GITHUB_OUTPUT
+          echo "timestamp=$(date +%s)" >> $GITHUB_OUTPUT
+
+      - name: 创建 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: rel-${{ steps.time.outputs.timestamp }}
+          name: Kernel build ${{ steps.time.outputs.time }}
+          prerelease: ${{ startsWith(github.ref_name, 'dev/') }}
+          files: artifacts/*
